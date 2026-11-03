@@ -11,6 +11,7 @@ import (
 	"github.com/mistakenelf/fm/help"
 	"github.com/mistakenelf/fm/image"
 	"github.com/mistakenelf/fm/internal/theme"
+	"github.com/mistakenelf/fm/internal/watcher"
 	"github.com/mistakenelf/fm/keys"
 	"github.com/mistakenelf/fm/markdown"
 	"github.com/mistakenelf/fm/pdf"
@@ -38,6 +39,9 @@ type Config struct {
 	PrettyMarkdown bool
 	ShowIcons      bool
 	Theme          theme.Theme
+	// WatchInterval controls how often the directory watcher re-reads the
+	// real directory. A zero value uses the default interval.
+	WatchInterval time.Duration
 }
 
 type model struct {
@@ -60,6 +64,10 @@ type model struct {
 	directoryBeforeMove   string
 	statusMessageLifetime time.Duration
 	statusMessageTimer    *time.Timer
+	// previewPath is the path of the file currently previewed in the right
+	// pane, used to reload or invalidate the preview when it changes on disk.
+	previewPath   string
+	watchInterval time.Duration
 }
 
 // New creates a new instance of the UI.
@@ -68,6 +76,7 @@ func New(cfg Config) model {
 	filetreeModel.SetTheme(cfg.Theme.SelectedTreeItemColor, cfg.Theme.UnselectedTreeItemColor)
 	filetreeModel.SetSelectionPath(cfg.SelectionPath)
 	filetreeModel.SetShowIcons(cfg.ShowIcons)
+	filetreeModel.AttachWatcher(watcher.NewPolling(cfg.WatchInterval))
 
 	secondaryFiletree := filetree.New(cfg.StartDir)
 	secondaryFiletree.SetTheme(cfg.Theme.SelectedTreeItemColor, cfg.Theme.UnselectedTreeItemColor)
@@ -146,6 +155,7 @@ func New(cfg Config) model {
 			{Key: defaultKeyMap.OpenInEditor.Help().Key, Description: defaultKeyMap.OpenInEditor.Help().Desc},
 			{Key: defaultKeyMap.CreateFile.Help().Key, Description: defaultKeyMap.CreateFile.Help().Desc},
 			{Key: defaultKeyMap.CreateDirectory.Help().Key, Description: defaultKeyMap.CreateDirectory.Help().Desc},
+			{Key: defaultKeyMap.Rescan.Help().Key, Description: defaultKeyMap.Rescan.Help().Desc},
 		},
 	)
 	helpModel.SetViewportDisabled(true)
@@ -164,6 +174,7 @@ func New(cfg Config) model {
 		showTextInput:         false,
 		textinput:             textinput.New(),
 		statusMessageLifetime: time.Second,
+		watchInterval:         cfg.WatchInterval,
 		csv:                   csv.New(),
 	}
 }

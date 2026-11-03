@@ -23,6 +23,7 @@ type KeyMap struct {
 	OpenInEditor        key.Binding
 	CreateFile          key.Binding
 	CreateDirectory     key.Binding
+	Rescan              key.Binding
 	ForceQuit           key.Binding
 	Quit                key.Binding
 	TogglePane          key.Binding
@@ -69,5 +70,6 @@ func DefaultKeyMap() KeyMap {
 		CreateFile:          key.NewBinding(key.WithKeys("N"), key.WithHelp("N", "Create new file")),
 		CreateDirectory:     key.NewBinding(key.WithKeys("M"), key.WithHelp("M", "Create new directory")),
 		RenameDirectoryItem: key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "Rename directory items")),
+		Rescan:              key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "Rescan current directory")),
 	}
 }

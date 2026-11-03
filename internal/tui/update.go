@@ -50,7 +50,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case key.Matches(msg, m.keyMap.ResetState):
 			if m.state == showMoveState {
-				cmds = append(cmds, m.filetree.GetDirectoryListingCmd(m.directoryBeforeMove))
+				var navCmd tea.Cmd
+
+				m.filetree, navCmd = m.filetree.BeginNavigation(m.directoryBeforeMove)
+				cmds = append(cmds, navCmd)
 			}
 
 			m.state = idleState
@@ -62,6 +65,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.filetree.State = filetree.IdleState
 			m.secondaryFiletree.SetDisabled(true)
 			m.activePane = 0
+			m.previewPath = ""
 
 			m.textinput, cmd = m.textinput.Update(msg)
 			cmds = append(cmds, cmd)
@@ -75,7 +79,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.filetree.State = filetree.MoveState
 				m.filetree.SetDisabled(true)
 				m.secondaryFiletree.SetDisabled(false)
-				cmds = append(cmds, m.secondaryFiletree.GetDirectoryListingCmd(m.filetree.CurrentDirectory))
+
+				var navCmd tea.Cmd
+
+				m.secondaryFiletree, navCmd = m.secondaryFiletree.BeginNavigation(m.filetree.CurrentDirectory)
+				cmds = append(cmds, navCmd)
 			}
 		case key.Matches(msg, m.keyMap.ShowTextInput):
 			if m.activePane == 0 && m.filetree.State == filetree.IdleState {
@@ -175,6 +183,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	m.filetree, cmd = m.filetree.Update(msg)
 	cmds = append(cmds, cmd)
+
+	// A filesystem-driven rescan may require updating or closing the file
+	// currently previewed in the right pane.
+	if report := m.filetree.ConsumeRefresh(); report.Happened {
+		cmds = append(cmds, m.syncPreviewCmd(report))
+	}
 
 	m.secondaryFiletree, cmd = m.secondaryFiletree.Update(msg)
 	cmds = append(cmds, cmd)

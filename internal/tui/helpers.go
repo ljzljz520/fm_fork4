@@ -2,9 +2,14 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/mistakenelf/fm/filetree"
 	"github.com/mistakenelf/fm/polish"
 )
 
@@ -30,7 +35,72 @@ func (m *model) resetViewports() {
 	m.csv.GotoTop()
 }
 
+// watcherWarning returns persistent, visible feedback for degraded watcher
+// states, including the manual rescan hint. It returns an empty string while
+// watching works normally.
+func (m *model) watcherWarning() string {
+	warn := lipgloss.NewStyle().Foreground(polish.Colors.Red600).Bold(true)
+
+	switch m.filetree.WatchStatus() {
+	case filetree.WatchDirectoryMissing:
+		return warn.Render("Directory is gone — press r to rescan, h to go up")
+	case filetree.WatchUnavailable:
+		return warn.Render("File watching is unavailable — press r to rescan")
+	default:
+		return ""
+	}
+}
+
+// watcherIndicator renders a compact health marker next to the item count.
+func (m *model) watcherIndicator() string {
+	switch m.filetree.WatchStatus() {
+	case filetree.WatchActive:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#16a34a")).Render("●")
+	case filetree.WatchDirectoryMissing, filetree.WatchUnavailable:
+		return lipgloss.NewStyle().Foreground(polish.Colors.Red600).Bold(true).Render("!")
+	default:
+		return ""
+	}
+}
+
+// syncPreviewCmd updates or invalidates the explicitly previewed file after a
+// filesystem-driven rescan. A deleted, moved or replaced-by-directory preview
+// is closed with visible feedback; a changed file is reloaded from disk.
+func (m *model) syncPreviewCmd(report filetree.RefreshReport) tea.Cmd {
+	if m.previewPath == "" || filepath.Dir(m.previewPath) != report.Directory {
+		return nil
+	}
+
+	name := filepath.Base(m.previewPath)
+
+	info, err := os.Stat(m.previewPath)
+
+	if contains(report.Removed, name) || err != nil || (info != nil && info.IsDir()) {
+		m.state = idleState
+		m.previewPath = ""
+		m.disableAllViewports()
+		m.resetViewports()
+
+		return m.newStatusMessageCmd(
+			lipgloss.NewStyle().
+				Foreground(polish.Colors.Red600).
+				Bold(true).
+				Render("Previewed file changed on disk; preview closed"))
+	}
+
+	if contains(report.Changed, name) {
+		return m.previewFileCmd(m.previewPath)
+	}
+
+	return nil
+}
+
 func (m *model) updateStatusBar() {
+	count := fmt.Sprintf("%d/%d %s",
+		m.filetree.Cursor+1,
+		m.filetree.GetTotalItems(),
+		m.watcherIndicator())
+
 	if m.filetree.GetSelectedItem().Name != "" {
 		statusMessage :=
 			m.filetree.CurrentDirectory +
@@ -69,18 +139,34 @@ func (m *model) updateStatusBar() {
 			statusMessage = m.statusMessage
 		}
 
-		if m.showTextInput {
+		switch {
+		case m.showTextInput:
 			statusMessage = m.textinput.View()
+		case m.filetree.StatusMessage != "" ||
+			m.code.StatusMessage != "" ||
+			m.markdown.StatusMessage != "" ||
+			m.pdf.StatusMessage != "" ||
+			m.image.StatusMessage != "" ||
+			m.statusMessage != "":
+			// Keep the explicit message already selected above.
+		case m.watcherWarning() != "":
+			// Degraded watcher state is permanently visible when no other
+			// message is being shown.
+			statusMessage = m.watcherWarning()
 		}
 
 		m.statusbar.SetContent(
 			m.filetree.GetSelectedItem().Name,
 			statusMessage,
-			fmt.Sprintf("%d/%d", m.filetree.Cursor+1, m.filetree.GetTotalItems()),
+			count,
 			fmt.Sprintf("%s", m.filetree.GetSelectedItem().FileSize),
 		)
 	} else {
 		statusMessage := "Directory is empty"
+
+		if warning := m.watcherWarning(); warning != "" {
+			statusMessage = warning
+		}
 
 		if m.showTextInput {
 			statusMessage = m.textinput.View()
@@ -89,7 +175,7 @@ func (m *model) updateStatusBar() {
 		m.statusbar.SetContent(
 			"N/A",
 			statusMessage,
-			fmt.Sprintf("%d/%d", 0, 0),
+			fmt.Sprintf("0/0 %s", m.watcherIndicator()),
 			"FM",
 		)
 	}

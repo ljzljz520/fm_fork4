@@ -8,8 +8,20 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/mistakenelf/fm/filesystem"
+	"github.com/mistakenelf/fm/internal/watcher"
 	"github.com/mistakenelf/fm/polish"
 )
+
+// BeginNavigation invalidates any in-flight listing and coalesced events and
+// requests the given directory. It binds the request to a new navigation
+// generation so late results from a directory the user has left cannot take
+// effect.
+func (m Model) BeginNavigation(directory string) (Model, tea.Cmd) {
+	m.watchGen++
+	m.clearPending()
+
+	return m, m.GetDirectoryListingCmd(directory)
+}
 
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	var cmds []tea.Cmd
@@ -35,7 +47,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	case moveDirectoryItemMsg:
 		m.State = IdleState
 
-		return m, m.GetDirectoryListingCmd(m.CurrentDirectory)
+		return m, m.beginNavigation(m.CurrentDirectory)
 	case copyToClipboardMsg:
 		cmds = append(cmds, m.NewStatusMessageCmd(
 			lipgloss.NewStyle().
@@ -44,16 +56,25 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	case createFileMsg:
 		m.State = IdleState
 
-		return m, m.GetDirectoryListingCmd(m.CurrentDirectory)
+		return m, m.beginNavigation(m.CurrentDirectory)
 	case createDirectoryMsg:
 		m.State = IdleState
 
-		return m, m.GetDirectoryListingCmd(m.CurrentDirectory)
+		return m, m.beginNavigation(m.CurrentDirectory)
 	case renameDirectoryItemMsg:
 		m.State = IdleState
 
-		return m, m.GetDirectoryListingCmd(m.CurrentDirectory)
+		return m, m.beginNavigation(m.CurrentDirectory)
 	case getDirectoryListingMsg:
+		// A newer navigation superseded this listing: discard it together
+		// with any watcher side effects, so the user is never pulled back to
+		// a directory they already left.
+		if msg.gen != m.watchGen {
+			return m, nil
+		}
+
+		oldFiles := m.files
+
 		if msg.files != nil {
 			m.files = msg.files
 		} else {
@@ -61,9 +82,94 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		}
 
 		m.CurrentDirectory = msg.workingDirectory
-		m.Cursor = 0
-		m.min = 0
-		m.max = max(m.max, m.height-1)
+		m.clearPending()
+
+		if msg.preserve {
+			m.preserveSelectionAndViewport(oldFiles, m.files)
+			m.lastRefresh = buildRefreshReport(m.CurrentDirectory, oldFiles, m.files)
+		} else {
+			m.Cursor = 0
+			m.min = 0
+			m.max = max(m.max, m.height-1)
+			m.lastRefresh = RefreshReport{}
+		}
+
+		m.err = nil
+
+		// (Re)establish the watcher only on real navigation: rescans must
+		// not churn the watcher, and recovery is delivered as events.
+		if m.watcher != nil {
+			m.watchStatus = WatchActive
+
+			if !msg.preserve {
+				cmds = append(cmds, m.startWatchingCmd(m.CurrentDirectory))
+
+				if !m.waiterArmed {
+					m.waiterArmed = true
+					cmds = append(cmds, waitForWatcherEventCmd(m.watcher))
+				}
+			}
+		}
+	case refreshFailedMsg:
+		// Bind the failure to the directory/generation that requested it.
+		if msg.gen != m.watchGen || msg.dir != m.CurrentDirectory {
+			return m, nil
+		}
+
+		m.clearPending()
+
+		if msg.directoryGone {
+			m.watchStatus = WatchDirectoryMissing
+		} else {
+			m.watchStatus = WatchUnavailable
+			cmds = append(cmds, m.NewStatusMessageCmd(
+				lipgloss.NewStyle().
+					Foreground(polish.Colors.Red600).
+					Bold(true).
+					Render("Could not refresh directory: "+msg.err.Error())))
+		}
+	case watcherEventMsg:
+		// The wait command has returned and must always be re-armed.
+		cmds = append(cmds, waitForWatcherEventCmd(m.watcher))
+
+		ev := watcher.Event(msg)
+
+		switch ev.Op {
+		case watcher.WatchFailed:
+			m.watchStatus = WatchUnavailable
+			m.clearPending()
+		case watcher.WatchLost:
+			if ev.Dir == "" || ev.Dir == m.CurrentDirectory {
+				m.watchStatus = WatchDirectoryMissing
+				m.clearPending()
+			}
+		case watcher.Resync:
+			if ev.Dir == m.CurrentDirectory {
+				m.watchStatus = WatchActive
+				m.resyncPending = true
+
+				if m.coalesceTimer == nil {
+					cmds = append(cmds, m.armCoalesceCmd(m.watchGen))
+				}
+			}
+		default:
+			// Events are bound to their directory. Observations from a
+			// directory the user navigated away from are dropped here.
+			if ev.Dir != "" && ev.Dir != m.CurrentDirectory {
+				break
+			}
+
+			// While the watcher is degraded, change events cannot be
+			// trusted; recovery arrives through Resync or a manual rescan.
+			if m.watchStatus == WatchDirectoryMissing ||
+				m.watchStatus == WatchUnavailable {
+				break
+			}
+
+			cmds = append(cmds, m.coalesce(ev))
+		}
+	case coalesceTickMsg:
+		return m, m.flushCoalescedCmd(msg.gen)
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, m.keyMap.Down):
@@ -153,13 +259,13 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				return m, nil
 			}
 
-			return m, m.GetDirectoryListingCmd(filesystem.HomeDirectory)
+			return m, m.beginNavigation(filesystem.HomeDirectory)
 		case key.Matches(msg, m.keyMap.GoToRootDirectory):
 			if m.State != IdleState {
 				return m, nil
 			}
 
-			return m, m.GetDirectoryListingCmd(filesystem.RootDirectory)
+			return m, m.beginNavigation(filesystem.RootDirectory)
 		case key.Matches(msg, m.keyMap.ToggleHidden):
 			if m.State != IdleState {
 				return m, nil
@@ -167,7 +273,15 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 			m.showHidden = !m.showHidden
 
-			return m, m.GetDirectoryListingCmd(m.CurrentDirectory)
+			return m, m.beginNavigation(m.CurrentDirectory)
+		case key.Matches(msg, m.keyMap.Rescan):
+			if m.State != IdleState {
+				return m, nil
+			}
+
+			// Manual rescan: retries a missing directory or an
+			// unavailable watcher and re-reads the real directory.
+			return m, m.beginNavigation(m.CurrentDirectory)
 		case key.Matches(msg, m.keyMap.OpenDirectory):
 			if m.State != IdleState {
 				return m, nil
@@ -178,14 +292,14 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			}
 
 			if m.files[m.Cursor].IsDirectory {
-				return m, m.GetDirectoryListingCmd(m.files[m.Cursor].Path)
+				return m, m.beginNavigation(m.files[m.Cursor].Path)
 			}
 		case key.Matches(msg, m.keyMap.PreviousDirectory):
 			if m.State != IdleState {
 				return m, nil
 			}
 
-			return m, m.GetDirectoryListingCmd(
+			return m, m.beginNavigation(
 				filepath.Dir(m.CurrentDirectory),
 			)
 		case key.Matches(msg, m.keyMap.CopyPathToClipboard):
@@ -238,7 +352,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			m.showDirectoriesOnly = !m.showDirectoriesOnly
 			m.showFilesOnly = false
 
-			return m, m.GetDirectoryListingCmd(m.CurrentDirectory)
+			return m, m.beginNavigation(m.CurrentDirectory)
 		case key.Matches(msg, m.keyMap.ShowFilesOnly):
 			if m.State != IdleState {
 				return m, nil
@@ -247,7 +361,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			m.showFilesOnly = !m.showFilesOnly
 			m.showDirectoriesOnly = false
 
-			return m, m.GetDirectoryListingCmd(m.CurrentDirectory)
+			return m, m.beginNavigation(m.CurrentDirectory)
 		case key.Matches(msg, m.keyMap.WriteSelectionPath):
 			if m.State != IdleState {
 				return m, nil
@@ -291,4 +405,84 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+// beginNavigation is the pointer-style helper used within Update, which owns
+// a mutable copy of the model.
+func (m *Model) beginNavigation(directory string) tea.Cmd {
+	m.watchGen++
+	m.clearPending()
+
+	return m.GetDirectoryListingCmd(directory)
+}
+
+// FlushPendingCmd performs the coalesced rescan immediately if events are
+// pending for the current generation. It is primarily used by tests driving
+// the model without the bubbletea runtime.
+func (m *Model) FlushPendingCmd() tea.Cmd {
+	return m.flushCoalescedCmd(m.watchGen)
+}
+
+// flushCoalescedCmd issues one rescan on behalf of the whole burst, or nil
+// when nothing is pending. Late flushes for a superseded generation are
+// discarded.
+func (m *Model) flushCoalescedCmd(gen uint64) tea.Cmd {
+	if gen != m.watchGen {
+		m.clearPending()
+		return nil
+	}
+
+	if len(m.pendingEvents) == 0 && !m.resyncPending {
+		return nil
+	}
+
+	m.clearPending()
+	m.watchStatus = WatchActive
+
+	// One rescan on behalf of the whole burst.
+	return m.RefreshCurrentDirectoryCmd()
+}
+
+// clearPending discards coalesced events and cancels an armed debounce timer.
+func (m *Model) clearPending() {
+	if m.coalesceTimer != nil {
+		m.coalesceTimer.Stop()
+		m.coalesceTimer = nil
+	}
+
+	m.pendingEvents = nil
+	m.resyncPending = false
+	m.pendingNames = make(map[string]struct{})
+}
+
+// coalesce records an event and arms the debounce timer for the first event of
+// a burst.
+func (m *Model) coalesce(ev watcher.Event) tea.Cmd {
+	if m.pendingNames == nil {
+		m.pendingNames = make(map[string]struct{})
+	}
+
+	names := []string{ev.Name}
+	if ev.Op == watcher.Rename && ev.OldName != "" {
+		names = append(names, ev.OldName)
+	}
+
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+
+		if _, ok := m.pendingNames[name]; ok {
+			continue
+		}
+
+		m.pendingNames[name] = struct{}{}
+		m.pendingEvents = append(m.pendingEvents, ev)
+	}
+
+	if m.coalesceTimer == nil {
+		return m.armCoalesceCmd(m.watchGen)
+	}
+
+	return nil
 }
